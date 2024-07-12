@@ -1,0 +1,128 @@
+version: "3.4"
+
+services:
+  saleor:
+    image: saleor
+    container_name: saleor
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    ports:
+      - 8000:8000
+    restart: unless-stopped
+    networks:
+      - saleor-bridge-network
+    stdin_open: true
+    tty: true
+    depends_on:
+      - db
+      - redis
+      - jaeger
+    volumes:
+      - .:/app
+      # shared volume between worker and api for media
+      - saleor-media:/app/media
+    env_file:
+      - production.env
+      - common.env
+      - backend.env
+    environment:
+      - JAEGER_AGENT_HOST=jaeger
+      - DASHBOARD_URL=http://localhost:9000/
+      - ALLOWED_HOSTS=localhost,api,127.0.0.1,sturdy-train-j795qq455v5c4rq-8000.app.github.dev
+
+  worker:
+    image: saleor
+    container_name: worker
+    command: celery -A saleor --app=saleor.celeryconf:app worker --loglevel=info -B
+    restart: unless-stopped
+    networks:
+      - saleor-bridge-network
+    env_file:
+      - production.env
+      - common.env
+      - backend.env
+    depends_on:
+      - redis
+      - mailpit
+    volumes:
+      # shared volume between worker and api for media
+      - saleor-media:/app/media
+
+  db:
+    image: library/postgres:15-alpine
+    container_name: db
+    ports:
+      - 5432:5432
+    restart: unless-stopped
+    networks:
+      - saleor-bridge-network
+    volumes:
+      - saleor-db:/var/lib/postgresql/data
+      # - ./replica_user.sql:/docker-entrypoint-initdb.d/replica_user.sql
+    environment:
+      - POSTGRES_USER=saleor
+      - POSTGRES_PASSWORD=saleor
+
+  db-init:
+    image: saleor
+    container_name: db-init
+    env_file:
+      - production.env
+      - common.env
+      - backend.env
+    entrypoint: sh -c "python3 manage.py migrate && python3 manage.py createsuperuser --noinput || echo 'User admin already exists'"
+    depends_on:
+      - saleor
+    networks:
+      - saleor-bridge-network
+
+  redis:
+    image: library/redis:7.0-alpine
+    container_name: redis
+    ports:
+      - 6379:6379
+    restart: unless-stopped
+    networks:
+      - saleor-bridge-network
+    volumes:
+      - saleor-redis:/data
+
+  jaeger:
+    image: jaegertracing/all-in-one
+    container_name: jaeger
+    ports:
+      - "5775:5775/udp"
+      - "6831:6831/udp"
+      - "6832:6832/udp"
+      - "5778:5778"
+      - "16686:16686"
+      - "14268:14268"
+      - "9411:9411"
+    restart: unless-stopped
+    networks:
+      - saleor-bridge-network
+    volumes:
+      - type: tmpfs
+        target: /tmp
+
+  mailpit:
+    image: axllent/mailpit
+    container_name: mailpit
+    ports:
+      - 1025:1025 # smtp server
+      - 8025:8025 # web ui. Visit http://localhost:8025/ to check emails
+    restart: unless-stopped
+    networks:
+      - saleor-bridge-network
+
+volumes:
+  saleor-db:
+    driver: local
+  saleor-redis:
+    driver: local
+  saleor-media:
+
+networks:
+  saleor-bridge-network:
+    driver: bridge
