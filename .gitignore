@@ -32,3 +32,7 @@ venv.bak/
 
 # Exported results file
 django-queries-results.html
+
+# Storage
+/db
+/redis
