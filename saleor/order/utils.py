@@ -89,7 +89,7 @@ def order_line_needs_automatic_fulfillment(line_data: OrderLineInfo) -> bool:
     return False
 
 
-def order_needs_automatic_fulfillment(lines_data: Iterable["OrderLineInfo"]) -> bool:
+def order_needs_automatic_fulfillment(lines_data: list["OrderLineInfo"]) -> bool:
     """Check if order has digital products which should be automatically fulfilled."""
     for line_data in lines_data:
         if line_data.is_digital and order_line_needs_automatic_fulfillment(line_data):
@@ -198,7 +198,7 @@ def create_order_line(
     line_data,
     manager,
     allocate_stock=False,
-):
+) -> OrderLine:
     channel = order.channel
     variant = line_data.variant
     quantity = line_data.quantity
@@ -348,7 +348,7 @@ def add_variant_to_order(
     app,
     manager,
     allocate_stock=False,
-):
+) -> OrderLine:
     """Add total_quantity of variant to order.
 
     Returns an order line the variant was added to.
@@ -397,13 +397,12 @@ def add_variant_to_order(
 
         return line
 
-    if line_data.variant_id:
-        return create_order_line(
-            order,
-            line_data,
-            manager,
-            allocate_stock,
-        )
+    return create_order_line(
+        order,
+        line_data,
+        manager,
+        allocate_stock,
+    )
 
 
 def update_line_base_unit_prices_with_custom_price(
@@ -797,7 +796,7 @@ def create_order_discount_for_order(
 ):
     """Add new order discount and update the prices."""
 
-    current_total = order.undiscounted_total
+    current_total: TaxedMoney = order.undiscounted_total
     currency = order.currency
 
     gross_total = apply_discount_to_value(
@@ -811,7 +810,7 @@ def create_order_discount_for_order(
         value_type=value_type,
         value=value,
         reason=reason,
-        amount=new_amount,  # type: ignore
+        amount=new_amount,  # type: ignore[misc]
         **kwargs,
     )
     return order_discount
@@ -1268,8 +1267,16 @@ def order_info_for_logs(order: Order, lines: Iterable[OrderLine]):
                 "total_price_net_amount": line_info.line.total_price_net_amount,
                 "total_price_gross_amount": line_info.line.total_price_gross_amount,
                 "has_voucher_code": bool(line_info.line.voucher_code),
-                "variant_listing_price": line_info.channel_listing.price_amount,
-                "variant_listing_discounted_price": line_info.channel_listing.discounted_price_amount,
+                "variant_listing_price": (
+                    line_info.channel_listing.price_amount
+                    if line_info.channel_listing
+                    else None
+                ),
+                "variant_listing_discounted_price": (
+                    line_info.channel_listing.discounted_price_amount
+                    if line_info.channel_listing
+                    else None
+                ),
                 "unit_discount_amount": line_info.line.unit_discount_amount,
                 "unit_discount_type": line_info.line.unit_discount_type,
                 "unit_discount_reason": line_info.line.unit_discount_reason,

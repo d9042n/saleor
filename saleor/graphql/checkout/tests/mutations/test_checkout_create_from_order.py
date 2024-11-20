@@ -1,7 +1,6 @@
-from datetime import datetime, timedelta
+import datetime
 
 import graphene
-import pytz
 
 from .....checkout.error_codes import CheckoutCreateFromOrderUnavailableVariantErrorCode
 from .....checkout.models import Checkout
@@ -315,6 +314,58 @@ def test_checkout_create_from_order_variant_not_found(
     assert unavailable_variant["variantId"] == first_line.product_variant_id
 
 
+def test_checkout_create_from_order_variant_without_channel_listing(
+    user_api_client, order_with_lines
+):
+    # given
+    order_with_lines.user = user_api_client.user
+    order_with_lines.save()
+    Stock.objects.update(quantity=10)
+    first_line = order_with_lines.lines.first()
+    first_line.variant.channel_listings.all().delete()
+
+    variables = {"id": graphene.Node.to_global_id("Order", order_with_lines.pk)}
+    # when
+    response = user_api_client.post_graphql(
+        MUTATION_CHECKOUT_CREATE_FROM_ORDER, variables
+    )
+
+    # then
+    order_lines_map = {line.variant.pk: line for line in order_with_lines.lines.all()}
+
+    content = get_graphql_content(response)
+    data = content["data"]["checkoutCreateFromOrder"]
+    checkout = Checkout.objects.get()
+    checkout_lines = checkout.lines.all()
+    assert checkout.user == order_with_lines.user
+    assert checkout.email == order_with_lines.user_email
+    checkout_lines_from_response = data["checkout"]["lines"]
+    assert (
+        len(checkout_lines_from_response)
+        == checkout_lines.count()
+        == len(order_lines_map) - 1
+    )
+    checkout_lines_from_response_map = {
+        line["variant"]["id"]: line for line in checkout_lines_from_response
+    }
+
+    assert data["checkout"]["id"] == graphene.Node.to_global_id("Checkout", checkout.pk)
+    _assert_checkout_lines(
+        order_lines_map, checkout_lines, checkout_lines_from_response_map
+    )
+
+    error_codes = CheckoutCreateFromOrderUnavailableVariantErrorCode
+    assert len(data["unavailableVariants"]) == 1
+    unavailable_variant = data["unavailableVariants"][0]
+    assert (
+        unavailable_variant["code"] == error_codes.UNAVAILABLE_VARIANT_IN_CHANNEL.name
+    )
+    assert unavailable_variant["lineId"] == graphene.Node.to_global_id(
+        "OrderLine", first_line.pk
+    )
+    assert unavailable_variant["variantId"] == first_line.product_variant_id
+
+
 def test_checkout_create_from_order_variant_not_available_in_channel(
     user_api_client, order_with_lines
 ):
@@ -527,7 +578,7 @@ def test_checkout_create_from_order_variant_not_available_for_purchase(
     user_api_client, order_with_lines
 ):
     # given
-    available_at = datetime.now(pytz.UTC) + timedelta(days=2)
+    available_at = datetime.datetime.now(tz=datetime.UTC) + datetime.timedelta(days=2)
     order_with_lines.user = user_api_client.user
     order_with_lines.save()
     Stock.objects.update(quantity=10)

@@ -48,6 +48,33 @@ def test_checkout_email_update(user_api_client, checkout_with_item):
     assert checkout.last_change != previous_last_change
 
 
+def test_checkout_email_update_when_variant_without_channel_listing(
+    user_api_client, checkout_with_item
+):
+    # given
+    checkout = checkout_with_item
+    checkout.email = None
+    checkout.save(update_fields=["email"])
+    previous_last_change = checkout.last_change
+
+    line = checkout.lines.first()
+    line.variant.channel_listings.all().delete()
+
+    email = "test@example.com"
+    variables = {"id": to_global_id_or_none(checkout), "email": email}
+
+    # when
+    response = user_api_client.post_graphql(CHECKOUT_EMAIL_UPDATE_MUTATION, variables)
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["checkoutEmailUpdate"]
+    assert not data["errors"]
+    checkout.refresh_from_db()
+    assert checkout.email == email
+    assert checkout.last_change != previous_last_change
+
+
 def test_checkout_email_update_validation(user_api_client, checkout_with_item):
     variables = {"id": to_global_id_or_none(checkout_with_item), "email": ""}
 
@@ -144,7 +171,9 @@ def test_checkout_email_update_triggers_webhooks(
 
     # confirm each sync webhook was called without saving event delivery
     assert mocked_send_webhook_request_sync.call_count == 3
-    # TODO (PE-371): Assert EventDelivery DB object wasn't created
+    assert not EventDelivery.objects.exclude(
+        webhook_id=checkout_updated_webhook.id
+    ).exists()
 
     shipping_methods_call, filter_shipping_call, tax_delivery_call = (
         mocked_send_webhook_request_sync.mock_calls

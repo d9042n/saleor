@@ -48,6 +48,36 @@ def test_checkout_update_language_code(
     assert checkout.last_change != previous_last_change
 
 
+def test_checkout_update_language_code_when_variant_without_channel_listing(
+    user_api_client,
+    checkout_with_gift_card,
+):
+    # given
+    language_code = "PL"
+    checkout = checkout_with_gift_card
+    previous_last_change = checkout.last_change
+
+    line = checkout.lines.first()
+    line.variant.channel_listings.all().delete()
+
+    variables = {"id": to_global_id_or_none(checkout), "languageCode": language_code}
+
+    # when
+    response = user_api_client.post_graphql(
+        MUTATION_CHECKOUT_UPDATE_LANGUAGE_CODE, variables
+    )
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["checkoutLanguageCodeUpdate"]
+    assert not data["errors"]
+
+    assert data["checkout"]["languageCode"] == language_code
+    checkout.refresh_from_db()
+    assert checkout.language_code == language_code.lower()
+    assert checkout.last_change != previous_last_change
+
+
 def test_with_active_problems_flow(api_client, checkout_with_problems):
     # given
     channel = checkout_with_problems.channel
@@ -126,7 +156,9 @@ def test_checkout_update_language_code_triggers_webhooks(
 
     # confirm each sync webhook was called without saving event delivery
     assert mocked_send_webhook_request_sync.call_count == 3
-    # TODO (PE-371): Assert EventDelivery DB object wasn't created
+    assert not EventDelivery.objects.exclude(
+        webhook_id=checkout_updated_webhook.id
+    ).exists()
 
     shipping_methods_call, filter_shipping_call, tax_delivery_call = (
         mocked_send_webhook_request_sync.mock_calls

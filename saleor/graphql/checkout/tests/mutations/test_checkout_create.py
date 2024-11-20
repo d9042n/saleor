@@ -5,7 +5,6 @@ from unittest.mock import patch
 
 import graphene
 import pytest
-import pytz
 from django.test import override_settings
 from django.utils import timezone
 
@@ -125,9 +124,7 @@ def test_checkout_create_with_default_channel(
     assert new_checkout.channel == channel_USD
     assert calculate_checkout_quantity(lines) == quantity
 
-    assert any(
-        [str(warning.message) == DEPRECATION_WARNING_MESSAGE for warning in warns]
-    )
+    assert any(str(warning.message) == DEPRECATION_WARNING_MESSAGE for warning in warns)
 
 
 def test_checkout_create_with_inactive_channel(
@@ -208,6 +205,32 @@ def test_checkout_create_with_unavailable_variant(
     assert error["variants"] == [variant_id]
 
 
+def test_checkout_create_with_variant_without_channel_listing(
+    api_client, stock, graphql_address_data, channel_USD
+):
+    variant = stock.product_variant
+    variant.channel_listings.filter(channel=channel_USD).delete()
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
+    test_email = "test@example.com"
+    shipping_address = graphql_address_data
+    variables = {
+        "checkoutInput": {
+            "channel": channel_USD.slug,
+            "lines": [{"quantity": 1, "variantId": variant_id}],
+            "email": test_email,
+            "shippingAddress": shipping_address,
+        }
+    }
+
+    response = api_client.post_graphql(MUTATION_CHECKOUT_CREATE, variables)
+
+    error = get_graphql_content(response)["data"]["checkoutCreate"]["errors"][0]
+
+    assert error["field"] == "lines"
+    assert error["code"] == CheckoutErrorCode.UNAVAILABLE_VARIANT_IN_CHANNEL.name
+    assert error["variants"] == [variant_id]
+
+
 def test_checkout_create_with_malicious_variant_id(
     api_client, stock, graphql_address_data, channel_USD
 ):
@@ -266,9 +289,7 @@ def test_checkout_create_with_inactive_default_channel(
 
     assert new_checkout.channel == channel_USD
 
-    assert any(
-        [str(warning.message) == DEPRECATION_WARNING_MESSAGE for warning in warns]
-    )
+    assert any(str(warning.message) == DEPRECATION_WARNING_MESSAGE for warning in warns)
 
 
 def test_checkout_create_with_inactive_and_active_default_channel(
@@ -298,9 +319,7 @@ def test_checkout_create_with_inactive_and_active_default_channel(
 
     assert new_checkout.channel == channel_USD
 
-    assert any(
-        [str(warning.message) == DEPRECATION_WARNING_MESSAGE for warning in warns]
-    )
+    assert any(str(warning.message) == DEPRECATION_WARNING_MESSAGE for warning in warns)
 
 
 def test_checkout_create_with_inactive_and_two_active_default_channel(
@@ -1763,6 +1782,9 @@ def test_checkout_create_check_lines_quantity_against_reservations(
     checkout_line = checkout.lines.create(
         variant=variant,
         quantity=3,
+        undiscounted_unit_price_amount=variant.channel_listings.get(
+            channel=channel_USD
+        ).price_amount,
     )
     Reservation.objects.create(
         checkout_line=checkout_line,
@@ -1836,7 +1858,7 @@ def test_checkout_create_available_for_purchase_from_tomorrow_product(
     product = variant.product
 
     product.channel_listings.update(
-        available_for_purchase_at=datetime.datetime.now(pytz.UTC)
+        available_for_purchase_at=datetime.datetime.now(tz=datetime.UTC)
         + datetime.timedelta(days=1)
     )
 
@@ -2720,26 +2742,27 @@ def test_checkout_create_triggers_webhooks(
 
     # confirm each sync webhook was called without saving event delivery
     assert mocked_send_webhook_request_sync.call_count == 3
-    # TODO (PE-371): Assert EventDelivery DB object wasn't created
+    assert not EventDelivery.objects.exclude(
+        webhook_id=checkout_created_webhook.id
+    ).exists()
 
-    shipping_methods_call, filter_shipping_call, tax_delivery_call = (
-        mocked_send_webhook_request_sync.mock_calls
-    )
-    shipping_methods_delivery = shipping_methods_call.args[0]
+    sync_deliveries = {
+        call.args[0].event_type: call.args[0]
+        for call in mocked_send_webhook_request_sync.mock_calls
+    }
+
+    assert WebhookEventSyncType.SHIPPING_LIST_METHODS_FOR_CHECKOUT in sync_deliveries
+    shipping_methods_delivery = sync_deliveries[
+        WebhookEventSyncType.SHIPPING_LIST_METHODS_FOR_CHECKOUT
+    ]
     assert shipping_methods_delivery.webhook_id == shipping_webhook.id
-    assert (
-        shipping_methods_delivery.event_type
-        == WebhookEventSyncType.SHIPPING_LIST_METHODS_FOR_CHECKOUT
-    )
-    assert shipping_methods_call.kwargs["timeout"] == settings.WEBHOOK_SYNC_TIMEOUT
 
-    filter_shipping_delivery = filter_shipping_call.args[0]
+    assert WebhookEventSyncType.CHECKOUT_FILTER_SHIPPING_METHODS in sync_deliveries
+    filter_shipping_delivery = sync_deliveries[
+        WebhookEventSyncType.CHECKOUT_FILTER_SHIPPING_METHODS
+    ]
     assert filter_shipping_delivery.webhook_id == shipping_filter_webhook.id
-    assert (
-        filter_shipping_delivery.event_type
-        == WebhookEventSyncType.CHECKOUT_FILTER_SHIPPING_METHODS
-    )
-    assert filter_shipping_call.kwargs["timeout"] == settings.WEBHOOK_SYNC_TIMEOUT
 
-    tax_delivery = tax_delivery_call.args[0]
+    assert WebhookEventSyncType.CHECKOUT_CALCULATE_TAXES in sync_deliveries
+    tax_delivery = sync_deliveries[WebhookEventSyncType.CHECKOUT_CALCULATE_TAXES]
     assert tax_delivery.webhook_id == tax_webhook.id

@@ -14,6 +14,8 @@ from ....menu import models as menu_models
 from ....page import models as page_models
 from ....product import models as product_models
 from ....shipping import models as shipping_models
+from ....webhook.event_types import WebhookEventAsyncType
+from ....webhook.utils import get_webhooks_for_event
 from ...core import ResolveInfo
 from ...core.descriptions import RICH_CONTENT
 from ...core.doc_category import DOC_CATEGORY_MAP
@@ -108,7 +110,7 @@ class BaseTranslateMutation(ModelMutation):
 
         try:
             node_type, node_pk = from_global_id_or_error(id)
-        except GraphQLError:
+        except GraphQLError as e:
             raise ValidationError(
                 {
                     "id": ValidationError(
@@ -116,7 +118,7 @@ class BaseTranslateMutation(ModelMutation):
                         code=TranslationErrorCode.INVALID,
                     )
                 }
-            )
+            ) from e
 
         # This mutation accepts either model IDs or translatable content IDs. Below we
         # check if provided ID refers to a translatable content which matches with the
@@ -475,10 +477,23 @@ class BaseBulkTranslateMutation(BaseMutation):
     def post_save_actions(cls, info, created_translations, updated_translations):
         manager = get_plugin_manager_promise(info.context).get()
 
-        for translation in created_translations:
-            cls.call_event(manager.translation_created, translation)
-        for translation in updated_translations:
-            cls.call_event(manager.translation_updated, translation)
+        if created_translations:
+            webhooks = get_webhooks_for_event(WebhookEventAsyncType.TRANSLATION_CREATED)
+            for translation in created_translations:
+                cls.call_event(
+                    manager.translation_created,
+                    translation,
+                    webhooks=webhooks,
+                )
+
+        if updated_translations:
+            webhooks = get_webhooks_for_event(WebhookEventAsyncType.TRANSLATION_UPDATED)
+            for translation in updated_translations:
+                cls.call_event(
+                    manager.translation_updated,
+                    translation,
+                    webhooks=webhooks,
+                )
 
     @classmethod
     @traced_atomic_transaction()
@@ -494,7 +509,7 @@ class BaseBulkTranslateMutation(BaseMutation):
             cleaned_inputs_map, index_error_map
         )
 
-        if any([bool(error) for error in index_error_map.values()]):
+        if any(bool(error) for error in index_error_map.values()):
             if error_policy == ErrorPolicyEnum.REJECT_EVERYTHING.value:
                 results = cls.get_results(instances_data_with_errors_list, True)
                 return cls(count=0, results=results)

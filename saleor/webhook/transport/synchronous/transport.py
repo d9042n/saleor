@@ -14,6 +14,7 @@ from ....core.db.connection import allow_writer
 from ....core.models import EventDelivery, EventPayload
 from ....core.tracing import webhooks_opentracing_trace
 from ....core.utils import get_domain
+from ....core.utils.url import sanitize_url_for_logging
 from ....graphql.webhook.subscription_payload import (
     generate_payload_from_subscription,
     initialize_request,
@@ -40,6 +41,7 @@ from ..utils import (
     generate_cache_key_for_webhook,
     get_delivery_for_webhook,
     handle_webhook_retry,
+    save_unsuccessful_delivery_attempt,
     send_webhook_using_http,
 )
 
@@ -58,22 +60,22 @@ logger = logging.getLogger(__name__)
     retry_kwargs={"max_retries": 5},
 )
 @allow_writer()
-def handle_transaction_request_task(self, delivery_id, request_event_id):
+def handle_transaction_request_task(self, delivery_id, request_event_id) -> None:
     request_event = TransactionEvent.objects.filter(id=request_event_id).first()
     if not request_event:
         logger.error(
-            f"Cannot find the request event with id: {request_event_id} "
-            f"for transaction-request webhook."
+            "Cannot find the request event with id: %s for transaction-request webhook.",
+            request_event_id,
         )
-        return None
+        return
     delivery = get_delivery_for_webhook(delivery_id)
     if not delivery:
         recalculate_refundable_for_checkout(request_event.transaction, request_event)
         logger.error(
-            f"Cannot find the delivery with id: {delivery_id} "
-            f"for transaction-request webhook."
+            "Cannot find the delivery with id: %s for transaction-request webhook.",
+            delivery_id,
         )
-        return None
+        return
     attempt = create_attempt(delivery, self.request.id)
     response, response_data = _send_webhook_request_sync(delivery, attempt=attempt)
     if response.response_status_code and response.response_status_code >= 500:
@@ -95,6 +97,7 @@ def _send_webhook_request_sync(
     parts = urlparse(webhook.target_url)
     domain = get_domain()
     message = data.encode("utf-8")
+    payload_size = len(message)
     signature = signature_for_payload(message, webhook.secret_key)
 
     if parts.scheme.lower() not in [WebhookSchemes.HTTP, WebhookSchemes.HTTPS]:
@@ -103,17 +106,17 @@ def _send_webhook_request_sync(
 
     logger.debug(
         "[Webhook] Sending payload to %r for event %r.",
-        webhook.target_url,
+        sanitize_url_for_logging(webhook.target_url),
         delivery.event_type,
     )
     if attempt is None:
-        attempt = create_attempt(delivery=delivery, task_id=None)
+        attempt = create_attempt(delivery=delivery, task_id=None, with_save=False)
     response = WebhookResponse(content="")
     response_data = None
 
     try:
         with webhooks_opentracing_trace(
-            delivery.event_type, domain, sync=True, app=webhook.app
+            delivery.event_type, domain, payload_size, sync=True, app=webhook.app
         ):
             response = send_webhook_using_http(
                 webhook.target_url,
@@ -130,7 +133,7 @@ def _send_webhook_request_sync(
         logger.info(
             "[Webhook] Failed parsing JSON response from %r: %r."
             "ID of failed DeliveryAttempt: %r . ",
-            webhook.target_url,
+            sanitize_url_for_logging(webhook.target_url),
             e,
             attempt.id,
         )
@@ -140,7 +143,7 @@ def _send_webhook_request_sync(
             logger.info(
                 "[Webhook] Failed request to %r: %r. "
                 "ID of failed DeliveryAttempt: %r . ",
-                webhook.target_url,
+                sanitize_url_for_logging(webhook.target_url),
                 response.content,
                 attempt.id,
             )
@@ -148,13 +151,14 @@ def _send_webhook_request_sync(
             logger.debug(
                 "[Webhook] Success response from %r."
                 "Successful DeliveryAttempt id: %r",
-                webhook.target_url,
+                sanitize_url_for_logging(webhook.target_url),
                 attempt.id,
             )
 
     attempt_update(attempt, response)
     delivery_update(delivery, response.status)
     observability.report_event_delivery_attempt(attempt)
+    save_unsuccessful_delivery_attempt(attempt)
     clear_successful_delivery(delivery)
     return response, response_data
 
@@ -216,6 +220,7 @@ def create_delivery_for_subscription_sync_event(
     request=None,
     allow_replica=False,
     pregenerated_payload: Optional[dict] = None,
+    with_save=True,
 ) -> Optional[EventDelivery]:
     """Generate webhook payload based on subscription query and create delivery object.
 
@@ -265,15 +270,16 @@ def create_delivery_for_subscription_sync_event(
     with allow_writer():
         # Use transaction to ensure EventPayload and EventDelivery are created together, preventing inconsistent DB state.
         with transaction.atomic():
-            event_payload = EventPayload.objects.create_with_payload_file(
-                json.dumps({**data})
-            )
-            event_delivery = EventDelivery.objects.create(
+            event_payload = EventPayload(payload=json.dumps({**data}))
+            event_delivery = EventDelivery(
                 status=EventDeliveryStatus.PENDING,
                 event_type=event_type,
                 payload=event_payload,
                 webhook=webhook,
             )
+            if with_save:
+                event_payload.save_as_file()
+                event_delivery.save()
     return event_delivery
 
 
@@ -298,20 +304,17 @@ def trigger_webhook_sync(
             request=request,
             allow_replica=allow_replica,
             pregenerated_payload=pregenerated_subscription_payload,
+            with_save=False,
         )
         if not delivery:
             return None
     else:
-        with allow_writer():
-            # Use transaction to ensure EventPayload and EventDelivery are created together, preventing inconsistent DB state.
-            with transaction.atomic():
-                event_payload = EventPayload.objects.create_with_payload_file(payload)
-                delivery = EventDelivery.objects.create(
-                    status=EventDeliveryStatus.PENDING,
-                    event_type=event_type,
-                    payload=event_payload,
-                    webhook=webhook,
-                )
+        delivery = EventDelivery(
+            status=EventDeliveryStatus.PENDING,
+            event_type=event_type,
+            payload=EventPayload(payload=payload),
+            webhook=webhook,
+        )
 
     kwargs = {}
     if timeout:
@@ -364,27 +367,20 @@ def trigger_all_webhooks_sync(
                 request=request_context,
                 requestor=requestor,
                 pregenerated_payload=pregenerated_payload,
+                with_save=False,
             )
             if not delivery:
                 return None
         else:
-            with allow_writer():
-                delivery = EventDelivery(
-                    status=EventDeliveryStatus.PENDING,
-                    event_type=event_type,
-                    payload=event_payload,
-                    webhook=webhook,
-                )
-                if event_payload is None:
-                    # Use transaction to ensure EventPayload and EventDelivery are created together, preventing inconsistent DB state.
-                    with transaction.atomic():
-                        event_payload = EventPayload.objects.create_with_payload_file(
-                            generate_payload()
-                        )
-                        delivery.payload = event_payload
-                        delivery.save()
-                else:
-                    delivery.save()
+            if event_payload is None:
+                event_payload = EventPayload(payload=generate_payload())
+            delivery = EventDelivery(
+                status=EventDeliveryStatus.PENDING,
+                event_type=event_type,
+                payload=event_payload,
+                webhook=webhook,
+            )
+
         response_data = send_webhook_request_sync(delivery)
         if parsed_response := parse_response(response_data):
             return parsed_response
